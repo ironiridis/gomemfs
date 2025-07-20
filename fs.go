@@ -18,13 +18,65 @@ type FS struct {
 	mu        sync.Mutex
 	keys      map[string]*key
 	callbacks []Fulfiller
+
+	caseInsensitive bool
+	statFulfills    bool
 }
 
-func New() *FS {
-	fs := FS{
+func New(o ...FSOption) (*FS, error) {
+	fs := &FS{
 		keys: make(map[string]*key),
 	}
-	return &fs
+	for i := range o {
+		if err := o[i].applyTo(fs); err != nil {
+			return nil, fmt.Errorf("failed to apply %T: %w", o[i], err)
+		}
+	}
+	return fs, nil
+}
+
+// Set applies an FSOption to an existing FS, if possible.
+func (d *FS) Set(o FSOption) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return o.applyTo(d)
+}
+
+// Len reports the number of keys currently stored in FS.
+func (d *FS) Len() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.keys)
+}
+
+// FulfillWith adds one or more Fulfiller callbacks to this FS. Fulfillers are
+// run in LIFO order.
+func (d *FS) FulfillWith(f ...Fulfiller) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.callbacks = append(d.callbacks, f...)
+	return nil
+}
+
+// Put sets the contents of key name in the FS. If the key already exists, it is
+// replaced. The []byte buffer must not be modified after calling Put; if needed
+// you may use [bytes.Clone] to create a private copy for Put.
+func (d *FS) Put(name string, content []byte, modtime time.Time, expire *time.Time) error {
+	n, err := d.normalize(name)
+	if err != nil {
+		return fmt.Errorf("cannot put key %q: %w", name, err)
+	}
+	d.mu.Lock()
+	k := &key{
+		bytes:   content,
+		name:    n,
+		modtime: modtime,
+		expire:  expire,
+		fs:      d,
+	}
+	d.keys[n] = k
+	d.mu.Unlock()
+	return nil
 }
 
 func (d *FS) lookup(name string) *key {
@@ -52,8 +104,12 @@ func (d *FS) fulfill(name string) (*key, error) {
 	var modtime *time.Time
 	var expire *time.Time
 	var err error
+
+	// we scan in reverse order! the last added callback is called
+	// first, until we encounter an error or get non-nil content
 	for i := range d.callbacks {
-		content, modtime, expire, err = d.callbacks[i](name)
+		idx := len(d.callbacks) - (i + 1)
+		content, modtime, expire, err = d.callbacks[idx](name)
 		if err != nil {
 			return nil, err
 		}
@@ -82,8 +138,10 @@ func (d *FS) fulfill(name string) (*key, error) {
 	return k, nil
 }
 
-// TODO: implement case-insensitive
 func (d *FS) normalize(name string) (string, error) {
+	if d.caseInsensitive {
+		name = strings.ToLower(name)
+	}
 	return strings.TrimPrefix(path.Clean(name), "/"), nil
 }
 
@@ -91,7 +149,7 @@ func (d *FS) normalize(name string) (string, error) {
 func (d *FS) Open(name string) (fs.File, error) {
 	n, err := d.normalize(name)
 	if err != nil {
-		return nil, fmt.Errorf("cannot normalize key %q: %w", name, err)
+		return nil, fmt.Errorf("cannot open key %q: %w", name, err)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -116,7 +174,7 @@ func (d *FS) Open(name string) (fs.File, error) {
 func (d *FS) ReadFile(name string) ([]byte, error) {
 	n, err := d.normalize(name)
 	if err != nil {
-		return nil, fmt.Errorf("cannot normalize key %q: %w", name, err)
+		return nil, fmt.Errorf("cannot retrieve key %q: %w", name, err)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -136,7 +194,7 @@ func (d *FS) ReadFile(name string) ([]byte, error) {
 func (d *FS) Stat(name string) (fs.FileInfo, error) {
 	n, err := d.normalize(name)
 	if err != nil {
-		return nil, fmt.Errorf("cannot normalize key %q: %w", name, err)
+		return nil, fmt.Errorf("cannot stat key %q: %w", name, err)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -145,8 +203,10 @@ func (d *FS) Stat(name string) (fs.FileInfo, error) {
 		return &FileStat{k: k}, nil
 	}
 
-	// TODO: fulfill-on-stat should be configurable! eg if a resource
-	// is always uncached, permitting Stat may not be reasonable
+	if !d.statFulfills {
+		return nil, fs.ErrNotExist
+	}
+
 	if k, err := d.fulfill(n); err != nil {
 		return nil, err
 	} else {
@@ -163,7 +223,7 @@ func (d *FS) Sub(dir string) (fs.FS, error) {
 func (d *FS) Expire(name string) error {
 	n, err := d.normalize(name)
 	if err != nil {
-		return fmt.Errorf("cannot normalize key %q: %w", name, err)
+		return fmt.Errorf("cannot expire key %q: %w", name, err)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
